@@ -91,17 +91,282 @@ app.post("/jobs", async (req, res) => {
 })
 
 
-app.get('/jobs', async(req, res) =>{
-    const cursor = jobs.find();
-    const result = await cursor.toArray();
-    res.send(result);
+
+app.get("/jobs", async (req, res) => {
+    try {
+        const query = {}
+
+        // Get a query parameter as a string
+        const getString = (value) => {
+            if (typeof value === "string") {
+                return value.trim()
+            }
+            return ""
+        }
+
+        // Escape special regex characters
+        const escapeRegex = (value) => {
+            return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+        }
+
+        // Create case-insensitive regex
+        const makeRegex = (value) => {
+            return new RegExp(escapeRegex(value), "i")
+        }
+
+        // --------------------------------
+        // 1. General text search
+        // --------------------------------
+
+        const search = getString(req.query.search)
+
+        if (search) {
+            const searchRegex = makeRegex(search)
+
+            query.$or = [
+                { title: searchRegex },
+                { company: searchRegex },
+                { category: searchRegex },
+                { location: searchRegex },
+                { description: searchRegex },
+                { responsibilities: searchRegex },
+                { requirements: searchRegex },
+                { skills: searchRegex },
+            ]
+        }
+
+        // --------------------------------
+        // 2. Partial string filters
+        // --------------------------------
+
+        const stringFields = [
+            "title",
+            "company",
+            "category",
+            "location",
+            "description",
+            "responsibilities",
+            "requirements",
+        ]
+
+        stringFields.forEach((field) => {
+            const value = getString(req.query[field])
+
+            if (value) {
+                query[field] = makeRegex(value)
+            }
+        })
+
+        // --------------------------------
+        // 3. Exact enum filters
+        // --------------------------------
+
+        const enumFields = [
+            "employmentType",
+            "workplaceType",
+            "experience",
+            "currency",
+            "status",
+        ]
+
+        enumFields.forEach((field) => {
+            const value = getString(req.query[field])
+
+            if (value) {
+                query[field] = makeRegex(value)
+            }
+        })
+
+        // --------------------------------
+        // 4. Skills array filter
+        // --------------------------------
+
+        let skills = req.query.skills || []
+
+        if (!Array.isArray(skills)) {
+            skills = [skills]
+        }
+
+        skills = skills
+            .flatMap((skill) => String(skill).split(","))
+            .map((skill) => skill.trim())
+            .filter(Boolean)
+
+        if (skills.length > 0) {
+            query.skills = {
+                $in: skills.map((skill) => makeRegex(skill)),
+            }
+        }
+
+        // --------------------------------
+        // 5. Salary filters
+        // --------------------------------
+
+        const minSalaryValue = getString(req.query.salaryMin)
+        const maxSalaryValue = getString(req.query.salaryMax)
+
+        const minSalary = minSalaryValue
+            ? Number(minSalaryValue)
+            : null
+
+        const maxSalary = maxSalaryValue
+            ? Number(maxSalaryValue)
+            : null
+
+        if (
+            (minSalary !== null &&
+                (!Number.isFinite(minSalary) || minSalary < 0)) ||
+            (maxSalary !== null &&
+                (!Number.isFinite(maxSalary) || maxSalary < 0)) ||
+            (minSalary !== null &&
+                maxSalary !== null &&
+                minSalary > maxSalary)
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid salary range",
+            })
+        }
+
+        // Job's minimum salary must be >= requested minimum
+        if (minSalary !== null) {
+            query.salaryMin = { $gte: minSalary }
+        }
+
+        // Job's maximum salary must be <= requested maximum
+        if (maxSalary !== null) {
+            query.salaryMax = { $lte: maxSalary }
+        }
+
+        // --------------------------------
+        // 6. Application deadline filters
+        // --------------------------------
+
+        const deadlineBefore = getString(req.query.deadlineBefore)
+        const deadlineAfter = getString(req.query.deadlineAfter)
+
+        if (deadlineBefore || deadlineAfter) {
+            query.applicationDeadline = {}
+
+            if (deadlineBefore) {
+                query.applicationDeadline.$lte = deadlineBefore
+            }
+
+            if (deadlineAfter) {
+                query.applicationDeadline.$gte = deadlineAfter
+            }
+        }
+
+        // --------------------------------
+        // 7. Fetch filtered jobs
+        // --------------------------------
+
+        const result = await jobs.find(query).toArray()
+
+        // Convert MongoDB ObjectId to string
+        const formattedJobs = result.map((job) => ({
+            ...job,
+            _id: job._id.toString(),
+        }))
+
+        res.status(200).json(formattedJobs)
+
+    } catch (error) {
+        console.error("Error fetching jobs:", error)
+
+        res.status(500).json({
+            success: false,
+            message: "Failed to fetch jobs",
+            error: error.message,
+        })
+    }
 })
-app.delete('/jobs/:id', async(req, res) =>{
-    const id = req.params.id;
-    const query = {_id: new ObjectId(id)};
-    const result = await jobs.deleteOne(query);
-    res.send(result);
+
+
+
+
+
+
+
+
+
+app.delete("/jobs/:id", async (req, res) => {
+    try {
+        const { id } = req.params
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid job ID",
+            })
+        }
+
+        const result = await jobs.deleteOne({
+            _id: new ObjectId(id),
+        })
+
+        if (result.deletedCount === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "Job not found",
+            })
+        }
+
+        res.status(200).json({
+            success: true,
+            message: "Job deleted successfully",
+        })
+    } catch (error) {
+        console.error("Delete Job Error:", error)
+
+        res.status(500).json({
+            success: false,
+            message: "Failed to delete job",
+        })
+    }
 })
+
+
+
+// get job details page 
+
+app.get("/jobs/:id", async (req, res) => {
+    try {
+        const { id } = req.params
+
+        // Validate MongoDB ObjectId
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).send({
+                message: "Invalid job ID",
+            })
+        }
+
+        // Find the selected job
+        const job = await jobs.findOne({
+            _id: new ObjectId(id),
+        })
+
+        // Check whether the job exists
+        if (!job) {
+            return res.status(404).send({
+                message: "Job not found",
+            })
+        }
+
+        // Return the selected job
+        res.status(200).send({
+            ...job,
+            _id: job._id.toString(),
+        })
+    } catch (error) {
+        console.error("Failed to fetch job:", error)
+
+        res.status(500).send({
+            message: "Failed to fetch job details",
+        })
+    }
+})
+
 
 // Root route
 app.get("/", (req, res) => {
