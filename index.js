@@ -9,7 +9,12 @@ const port = process.env.PORT || 8000
 
 // Middleware
 app.use(express.json())
-app.use(cors())
+app.use(
+    cors({
+        origin: "http://localhost:3000",
+        credentials: true,
+    })
+)
 
 // MongoDB connection
 const client = new MongoClient(process.env.MONGODB_URL)
@@ -576,12 +581,6 @@ app.get("/jobs", async (req, res) => {
         })
     }
 })
-
-
-
-
-
-
 
 
 
