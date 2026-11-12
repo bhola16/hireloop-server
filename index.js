@@ -251,6 +251,140 @@ app.delete("/applications", async (req, res) => {
 
 
 
+// GET: Applications submitted by a seeker
+app.get("/applications/seeker/:userId", async (req, res) => {
+    try {
+        const { userId } = req.params
+
+        if (!userId) {
+            return res.status(400).json({
+                success: false,
+                message: "User ID is required",
+            })
+        }
+
+        const seekerApplications = await applications
+            .find({ userId })
+            .sort({ appliedAt: -1 })
+            .toArray()
+
+        const enrichedApplications = await Promise.all(
+            seekerApplications.map(async (application) => {
+                let job = null
+
+                if (ObjectId.isValid(application.jobId)) {
+                    job = await jobs.findOne({
+                        _id: new ObjectId(application.jobId),
+                    })
+                }
+
+                return {
+                    ...application,
+                    _id: application._id.toString(),
+                    jobTitle: job?.title ?? application.jobTitle,
+                    companyName: job?.company ?? application.companyName,
+                    location: job?.location ?? "",
+                    employmentType: job?.employmentType ?? "",
+                    workplaceType: job?.workplaceType ?? "",
+                }
+            })
+        )
+
+        res.status(200).json({
+            success: true,
+            applications: enrichedApplications,
+        })
+    } catch (error) {
+        console.error("Get Seeker Applications Error:", error)
+
+        res.status(500).json({
+            success: false,
+            message: "Failed to retrieve applications",
+        })
+    }
+})
+
+// GET: Applicants for a specific job (recruiter view)
+app.get("/applications/job/:jobId", async (req, res) => {
+    try {
+        const { jobId } = req.params
+        const { recruiterId } = req.query
+
+        if (!ObjectId.isValid(jobId)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid job ID",
+            })
+        }
+
+        if (!recruiterId || typeof recruiterId !== "string") {
+            return res.status(400).json({
+                success: false,
+                message: "Recruiter ID is required",
+            })
+        }
+
+        const job = await jobs.findOne({
+            _id: new ObjectId(jobId),
+        })
+
+        if (!job) {
+            return res.status(404).json({
+                success: false,
+                message: "Job not found",
+            })
+        }
+
+        // This assumes each job document stores its recruiter's ID
+        // as recruiterId. Use the actual field from your job documents.
+        if (job.recruiterId !== recruiterId) {
+            return res.status(403).json({
+                success: false,
+                message: "You are not authorized to view these applicants",
+            })
+        }
+
+        const jobApplications = await applications
+            .find({ jobId })
+            .sort({ appliedAt: -1 })
+            .toArray()
+
+        const enrichedApplicants = await Promise.all(
+            jobApplications.map(async (application) => {
+                const applicant = await users.findOne({
+                    email: application.email,
+                })
+
+                return {
+                    ...application,
+                    _id: application._id.toString(),
+                    applicantName:
+                        applicant?.name ?? application.applicantName ?? "Unknown",
+                    email: application.email,
+                }
+            })
+        )
+
+        res.status(200).json({
+            success: true,
+            job: {
+                _id: job._id.toString(),
+                title: job.title,
+                company: job.company,
+            },
+            applicants: enrichedApplicants,
+        })
+    } catch (error) {
+        console.error("Get Job Applicants Error:", error)
+
+        res.status(500).json({
+            success: false,
+            message: "Failed to retrieve applicants",
+        })
+    }
+})
+
+
 
 
 app.get("/jobs", async (req, res) => {
