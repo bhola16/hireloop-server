@@ -32,6 +32,7 @@ const database = client.db("hireloop")
 
 const users = database.collection("user")
 const jobs = database.collection("jobs")
+const applications = database.collection("applications")
 
 // Get all users
 app.get("/users", async (req, res) => {
@@ -89,6 +90,166 @@ app.post("/jobs", async (req, res) => {
         })
     }
 })
+
+
+app.post("/applications", async (req, res) => {
+    try {
+        const {
+            jobId,
+            userId,
+            email,
+            jobTitle,
+            companyName,
+        } = req.body
+
+        // Validate required fields
+        if (!jobId || !userId || !email) {
+            return res.status(400).json({
+                success: false,
+                message: "Required application information is missing",
+            })
+        }
+
+        // Check whether the job exists
+        if (!ObjectId.isValid(jobId)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid job ID",
+            })
+        }
+
+        const job = await jobs.findOne({
+            _id: new ObjectId(jobId),
+        })
+
+        if (!job) {
+            return res.status(404).json({
+                success: false,
+                message: "Job not found",
+            })
+        }
+
+        if (job.status !== "active") {
+            return res.status(400).json({
+                success: false,
+                message: "This job is not accepting applications",
+            })
+        }
+
+        // Prevent duplicate applications
+        const existingApplication = await applications.findOne({
+            jobId,
+            userId,
+        })
+
+        if (existingApplication) {
+            return res.status(409).json({
+                success: false,
+                message: "You have already applied for this job",
+            })
+        }
+
+        const newApplication = {
+            jobId,
+            userId,
+            email,
+            jobTitle: job.title,
+            companyName: job.company,
+            status: "pending",
+            appliedAt: new Date(),
+        }
+
+        const result = await applications.insertOne(newApplication)
+
+        res.status(201).json({
+            success: true,
+            message: "Application submitted successfully",
+            insertedId: result.insertedId,
+        })
+
+    } catch (error) {
+        console.error("Create Application Error:", error)
+
+        res.status(500).json({
+            success: false,
+            message: "Failed to submit application",
+        })
+    }
+})
+
+
+// Check whether a seeker has applied for a job
+app.get("/applications/check", async (req, res) => {
+    try {
+        const { jobId, userId } = req.query
+
+        if (!jobId || !userId) {
+            return res.status(400).json({
+                success: false,
+                message: "Job ID and user ID are required",
+            })
+        }
+
+        const application = await applications.findOne({
+            jobId,
+            userId,
+        })
+
+        res.status(200).json({
+            success: true,
+            hasApplied: Boolean(application),
+        })
+    } catch (error) {
+        console.error("Check Application Error:", error)
+
+        res.status(500).json({
+            success: false,
+            message: "Failed to check application",
+        })
+    }
+})
+
+
+// Withdraw an application
+app.delete("/applications", async (req, res) => {
+    try {
+        const { jobId, userId } = req.body
+
+        if (!jobId || !userId) {
+            return res.status(400).json({
+                success: false,
+                message: "Job ID and user ID are required",
+            })
+        }
+
+        const result = await applications.deleteOne({
+            jobId,
+            userId,
+        })
+
+        if (result.deletedCount === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "Application not found",
+            })
+        }
+
+        res.status(200).json({
+            success: true,
+            message: "Application withdrawn successfully",
+        })
+    } catch (error) {
+        console.error("Withdraw Application Error:", error)
+
+        res.status(500).json({
+            success: false,
+            message: "Failed to withdraw application",
+        })
+    }
+})
+
+
+
 
 
 
