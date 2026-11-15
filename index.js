@@ -6,77 +6,159 @@ import { MongoClient, ObjectId } from "mongodb"
 
 const app = express()
 const port = process.env.PORT || 8000
+const FREE_APPLICATION_LIMIT = 5
+const APPLICATION_FEE_BDT = Number(process.env.APPLICATION_FEE_BDT || 20)
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000"
 
 // Middleware
 app.use(express.json())
 app.use(
     cors({
-        origin: "http://localhost:3000",
+        origin: FRONTEND_URL,
         credentials: true,
     })
 )
 
-// MongoDB connection
-const client = new MongoClient(process.env.MONGODB_URL)
-
-export async function connectToMongoDB() {
-    try {
-        await client.connect()
-        console.log("You successfully connected to MongoDB Database..!")
-        return client
-    } catch (err) {
-        console.error("MongoDB connection failed:", err)
-        throw err
-    }
+// MongoDB
+if (!process.env.MONGODB_URL) {
+    throw new Error("MONGODB_URL is missing from environment variables")
 }
 
-// Database and collections
-await connectToMongoDB()
-
+const client = new MongoClient(process.env.MONGODB_URL)
 const database = client.db("hireloop")
 
 const users = database.collection("user")
 const jobs = database.collection("jobs")
 const applications = database.collection("applications")
+const applicationUsage = database.collection("applicationUsage")
+const applicationPayments = database.collection("applicationPayments")
 
-// Get all users
-app.get("/users", async (req, res) => {
+// Reusable async handler: route errors go to the central error middleware.
+const asyncHandler = (handler) => (req, res, next) =>
+    Promise.resolve(handler(req, res, next)).catch(next)
+
+class HttpError extends Error {
+    constructor(status, message, extra = {}) {
+        super(message)
+        this.status = status
+        this.extra = extra
+    }
+}
+
+const isValidId = (id) => typeof id === "string" && ObjectId.isValid(id)
+
+const getCurrentMonth = () => {
+    const now = new Date()
+    return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`
+}
+
+const getCurrentMonthRange = () => {
+    const now = new Date()
+    return {
+        start: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)),
+        end: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)),
+    }
+}
+
+// Count both Date values and ISO strings to support existing records.
+const countApplicationsThisMonth = async (userId) => {
+    const { start, end } = getCurrentMonthRange()
+
+    return applications.countDocuments({
+        userId,
+        $or: [
+            { appliedAt: { $gte: start, $lt: end } },
+            {
+                appliedAt: {
+                    $gte: start.toISOString(),
+                    $lt: end.toISOString(),
+                },
+            },
+        ],
+    })
+}
+
+// Create a monthly usage document the first time a seeker is checked.
+// Existing applications from the current month are included.
+const getOrCreateMonthlyUsage = async (userId) => {
+    const monthKey = getCurrentMonth()
+
     try {
+        await applicationUsage.updateOne(
+            { userId, monthKey },
+            {
+                $setOnInsert: {
+                    userId,
+                    monthKey,
+                    count: await countApplicationsThisMonth(userId),
+                    createdAt: new Date(),
+                },
+            },
+            { upsert: true }
+        )
+    } catch (error) {
+        // Another request may have created this unique record concurrently.
+        if (error.code !== 11000) throw error
+    }
+
+    return applicationUsage.findOne({ userId, monthKey })
+}
+
+const createIndexes = async () => {
+    await applications.createIndex(
+        { userId: 1, jobId: 1 },
+        { unique: true, name: "unique_user_job_application" }
+    )
+
+    await applicationUsage.createIndex(
+        { userId: 1, monthKey: 1 },
+        { unique: true, name: "unique_user_month_usage" }
+    )
+
+    await applicationPayments.createIndex(
+        { userId: 1, jobId: 1, monthKey: 1, status: 1 }
+    )
+
+    await applicationPayments.createIndex(
+        { userId: 1, monthKey: 1, createdAt: -1 }
+    )
+}
+
+// -----------------------------------------------------------------------------
+// USERS
+// -----------------------------------------------------------------------------
+
+app.get(
+    "/users",
+    asyncHandler(async (req, res) => {
         const result = await users.find({}).toArray()
         res.status(200).json(result)
-    } catch (error) {
-        console.error("Get Users Error:", error)
+    })
+)
 
-        res.status(500).json({
-            success: false,
-            message: "Failed to retrieve users",
-        })
-    }
-})
+// -----------------------------------------------------------------------------
+// JOBS
+// -----------------------------------------------------------------------------
 
-// Create a new job
-app.post("/jobs", async (req, res) => {
-    try {
+app.post(
+    "/jobs",
+    asyncHandler(async (req, res) => {
         const job = req.body
 
-        // Basic validation
-        if (
-            !job.title ||
-            !job.company ||
-            !job.category ||
-            !job.description
-        ) {
-            return res.status(400).json({
-                success: false,
-                message: "Required job information is missing",
-            })
+        if (!job.title?.trim() || !job.company?.trim() ||
+            !job.category?.trim() || !job.description?.trim()) {
+            throw new HttpError(400, "Required job information is missing")
         }
 
+        if (!job.recruiterId) {
+            throw new HttpError(400, "Recruiter ID is required")
+        }
+
+        const now = new Date().toISOString()
         const newJob = {
             ...job,
-            status: job.status || "published",
-            createdAt: new Date(),
-            updatedAt: new Date(),
+            createdAt: now,
+            updatedAt: now,
         }
 
         const result = await jobs.insertOne(newJob)
@@ -86,72 +168,441 @@ app.post("/jobs", async (req, res) => {
             message: "Job created successfully",
             insertedId: result.insertedId,
         })
-    } catch (error) {
-        console.error("Create Job Error:", error)
+    })
+)
 
-        res.status(500).json({
-            success: false,
-            message: "Failed to create job",
+app.get(
+    "/jobs",
+    asyncHandler(async (req, res) => {
+        const query = {}
+
+        const getString = (value) =>
+            typeof value === "string" ? value.trim() : ""
+
+        const escapeRegex = (value) =>
+            value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+
+        const makeRegex = (value) =>
+            new RegExp(escapeRegex(value), "i")
+
+        const search = getString(req.query.search)
+
+        if (search) {
+            const searchRegex = makeRegex(search)
+            query.$or = [
+                { title: searchRegex },
+                { company: searchRegex },
+                { category: searchRegex },
+                { location: searchRegex },
+                { description: searchRegex },
+                { responsibilities: searchRegex },
+                { requirements: searchRegex },
+                { skills: searchRegex },
+            ]
+        }
+
+        const stringFields = [
+            "title",
+            "company",
+            "category",
+            "location",
+            "description",
+            "responsibilities",
+            "requirements",
+        ]
+
+        stringFields.forEach((field) => {
+            const value = getString(req.query[field])
+            if (value) query[field] = makeRegex(value)
         })
-    }
-})
 
+        const enumFields = [
+            "employmentType",
+            "workplaceType",
+            "experience",
+            "currency",
+            "status",
+        ]
 
-app.post("/applications", async (req, res) => {
-    try {
-        const {
-            jobId,
-            userId,
-            email,
-            jobTitle,
-            companyName,
-        } = req.body
-
-        // Validate required fields
-        if (!jobId || !userId || !email) {
-            return res.status(400).json({
-                success: false,
-                message: "Required application information is missing",
-            })
-        }
-
-        // Check whether the job exists
-        if (!ObjectId.isValid(jobId)) {
-            return res.status(400).json({
-                success: false,
-                message: "Invalid job ID",
-            })
-        }
-
-        const job = await jobs.findOne({
-            _id: new ObjectId(jobId),
+        enumFields.forEach((field) => {
+            const value = getString(req.query[field])
+            if (value) query[field] = makeRegex(value)
         })
 
-        if (!job) {
-            return res.status(404).json({
-                success: false,
-                message: "Job not found",
-            })
+        let skills = req.query.skills || []
+        if (!Array.isArray(skills)) skills = [skills]
+
+        skills = skills
+            .flatMap((skill) => String(skill).split(","))
+            .map((skill) => skill.trim())
+            .filter(Boolean)
+
+        if (skills.length) {
+            query.skills = { $in: skills.map(makeRegex) }
         }
+
+        const minSalaryValue = getString(req.query.salaryMin)
+        const maxSalaryValue = getString(req.query.salaryMax)
+        const minSalary = minSalaryValue ? Number(minSalaryValue) : null
+        const maxSalary = maxSalaryValue ? Number(maxSalaryValue) : null
+
+        if (
+            (minSalary !== null && (!Number.isFinite(minSalary) || minSalary < 0)) ||
+            (maxSalary !== null && (!Number.isFinite(maxSalary) || maxSalary < 0)) ||
+            (minSalary !== null && maxSalary !== null && minSalary > maxSalary)
+        ) {
+            throw new HttpError(400, "Invalid salary range")
+        }
+
+        if (minSalary !== null) query.salaryMin = { $gte: minSalary }
+        if (maxSalary !== null) query.salaryMax = { $lte: maxSalary }
+
+        const deadlineBefore = getString(req.query.deadlineBefore)
+        const deadlineAfter = getString(req.query.deadlineAfter)
+
+        if (deadlineBefore || deadlineAfter) {
+            query.applicationDeadline = {}
+            if (deadlineBefore) query.applicationDeadline.$lte = deadlineBefore
+            if (deadlineAfter) query.applicationDeadline.$gte = deadlineAfter
+        }
+
+        const result = await jobs.find(query).toArray()
+        res.status(200).json(
+            result.map((job) => ({ ...job, _id: job._id.toString() }))
+        )
+    })
+)
+
+app.get(
+    "/jobs/:id",
+    asyncHandler(async (req, res) => {
+        const { id } = req.params
+        if (!isValidId(id)) throw new HttpError(400, "Invalid job ID")
+
+        const job = await jobs.findOne({ _id: new ObjectId(id) })
+        if (!job) throw new HttpError(404, "Job not found")
+
+        res.status(200).json({ ...job, _id: job._id.toString() })
+    })
+)
+
+app.delete(
+    "/jobs/:id",
+    asyncHandler(async (req, res) => {
+        const { id } = req.params
+        if (!isValidId(id)) throw new HttpError(400, "Invalid job ID")
+
+        const result = await jobs.deleteOne({ _id: new ObjectId(id) })
+        if (!result.deletedCount) throw new HttpError(404, "Job not found")
+
+        res.status(200).json({
+            success: true,
+            message: "Job deleted successfully",
+        })
+    })
+)
+
+app.put(
+    "/jobs/:id",
+    asyncHandler(async (req, res) => {
+        const { id } = req.params
+        const { recruiterId, ...data } = req.body
+
+        if (!isValidId(id)) throw new HttpError(400, "Invalid job ID")
+        if (!recruiterId) throw new HttpError(400, "Recruiter ID is required")
+
+        const existingJob = await jobs.findOne({ _id: new ObjectId(id) })
+        if (!existingJob) throw new HttpError(404, "Job not found")
+
+        if (existingJob.recruiterId !== recruiterId) {
+            throw new HttpError(403, "You are not authorized to edit this job")
+        }
+
+        const allowedFields = [
+            "title",
+            "company",
+            "category",
+            "employmentType",
+            "workplaceType",
+            "location",
+            "experience",
+            "salaryMin",
+            "salaryMax",
+            "currency",
+            "description",
+            "responsibilities",
+            "requirements",
+            "skills",
+            "applicationDeadline",
+            "status",
+        ]
+
+        const updateData = Object.fromEntries(
+            allowedFields
+                .filter((field) => data[field] !== undefined)
+                .map((field) => [field, data[field]])
+        )
+
+        if (!Object.keys(updateData).length) {
+            throw new HttpError(400, "No fields provided for update")
+        }
+
+        if (
+            (updateData.title !== undefined && !updateData.title?.trim()) ||
+            (updateData.company !== undefined && !updateData.company?.trim())
+        ) {
+            throw new HttpError(400, "Job title and company cannot be empty")
+        }
+
+        const { salaryMin, salaryMax } = updateData
+
+        if (
+            (salaryMin !== undefined && (!Number.isFinite(salaryMin) || salaryMin < 0)) ||
+            (salaryMax !== undefined && (!Number.isFinite(salaryMax) || salaryMax < 0))
+        ) {
+            throw new HttpError(400, "Invalid salary amount")
+        }
+
+        if (
+            salaryMin !== undefined &&
+            salaryMax !== undefined &&
+            salaryMin > salaryMax
+        ) {
+            throw new HttpError(400, "Minimum salary cannot exceed maximum salary")
+        }
+
+        if (
+            updateData.status !== undefined &&
+            !["active", "draft", "closed"].includes(updateData.status)
+        ) {
+            throw new HttpError(400, "Invalid job status")
+        }
+
+        if (
+            updateData.skills !== undefined &&
+            !Array.isArray(updateData.skills)
+        ) {
+            throw new HttpError(400, "Skills must be an array")
+        }
+
+        updateData.updatedAt = new Date().toISOString()
+
+        await jobs.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: updateData }
+        )
+
+        const updatedJob = await jobs.findOne({ _id: new ObjectId(id) })
+
+        res.status(200).json({
+            success: true,
+            message: "Job updated successfully",
+            job: updatedJob,
+        })
+    })
+)
+
+// -----------------------------------------------------------------------------
+// APPLICATION USAGE
+// -----------------------------------------------------------------------------
+
+app.get(
+    "/applications/usage",
+    asyncHandler(async (req, res) => {
+        const { userId } = req.query
+        if (typeof userId !== "string" || !userId) {
+            throw new HttpError(400, "User ID is required")
+        }
+
+        const usage = await getOrCreateMonthlyUsage(userId)
+        const count = usage?.count || 0
+
+        res.status(200).json({
+            success: true,
+            month: getCurrentMonth(),
+            limit: FREE_APPLICATION_LIMIT,
+            totalApplications: count,
+            freeApplicationsUsed: Math.min(count, FREE_APPLICATION_LIMIT),
+            freeApplicationsRemaining: Math.max(FREE_APPLICATION_LIMIT - count, 0),
+            paymentRequired: count >= FREE_APPLICATION_LIMIT,
+        })
+    })
+)
+
+// Keep the existing lifetime count endpoint for compatibility.
+app.get(
+    "/applications/count",
+    asyncHandler(async (req, res) => {
+        const { userId } = req.query
+        if (typeof userId !== "string" || !userId) {
+            throw new HttpError(400, "User ID is required")
+        }
+
+        const count = await applications.countDocuments({ userId })
+        res.status(200).json({ success: true, count })
+    })
+)
+
+// -----------------------------------------------------------------------------
+// DEMO PAYMENT
+// -----------------------------------------------------------------------------
+
+app.post(
+    "/applications/demo-payment",
+    asyncHandler(async (req, res) => {
+        const { userId, jobId } = req.body
+
+        if (!userId || !jobId) {
+            throw new HttpError(400, "User ID and Job ID are required")
+        }
+
+        if (!isValidId(jobId)) throw new HttpError(400, "Invalid job ID")
+
+        const job = await jobs.findOne({ _id: new ObjectId(jobId) })
+        if (!job) throw new HttpError(404, "Job not found")
 
         if (job.status !== "active") {
-            return res.status(400).json({
-                success: false,
-                message: "This job is not accepting applications",
-            })
+            throw new HttpError(400, "This job is not accepting applications")
         }
 
-        // Prevent duplicate applications
-        const existingApplication = await applications.findOne({
-            jobId,
-            userId,
-        })
-
+        const existingApplication = await applications.findOne({ userId, jobId })
         if (existingApplication) {
-            return res.status(409).json({
-                success: false,
-                message: "You have already applied for this job",
-            })
+            throw new HttpError(409, "You have already applied for this job")
+        }
+
+        const usage = await getOrCreateMonthlyUsage(userId)
+        if ((usage?.count || 0) < FREE_APPLICATION_LIMIT) {
+            throw new HttpError(400, "You still have free applications available")
+        }
+
+        const payment = {
+            userId,
+            jobId,
+            monthKey: getCurrentMonth(),
+            amount: APPLICATION_FEE_BDT,
+            currency: "BDT",
+            method: "demo",
+            status: "succeeded",
+            usedAt: null,
+            createdAt: new Date(),
+        }
+
+        const result = await applicationPayments.insertOne(payment)
+
+        res.status(201).json({
+            success: true,
+            message: "Demo payment successful",
+            paymentId: result.insertedId.toString(),
+            payment: {
+                amount: payment.amount,
+                currency: payment.currency,
+                method: payment.method,
+                status: payment.status,
+            },
+        })
+    })
+)
+
+// -----------------------------------------------------------------------------
+// SUBMIT APPLICATION
+// Both paths are supported so the existing frontend can keep using /applications.
+// -----------------------------------------------------------------------------
+
+const submitApplication = asyncHandler(async (req, res) => {
+    const { jobId, userId, email, paymentId } = req.body
+
+    if (!jobId || !userId || !email) {
+        throw new HttpError(400, "Job ID, user ID and email are required")
+    }
+
+    if (!isValidId(jobId)) throw new HttpError(400, "Invalid job ID")
+    if (paymentId && !isValidId(paymentId)) {
+        throw new HttpError(400, "Invalid payment ID")
+    }
+
+    const job = await jobs.findOne({ _id: new ObjectId(jobId) })
+    if (!job) throw new HttpError(404, "Job not found")
+
+    if (job.status !== "active") {
+        throw new HttpError(400, "This job is not accepting applications")
+    }
+
+    const existingApplication = await applications.findOne({ jobId, userId })
+    if (existingApplication) {
+        throw new HttpError(409, "You have already applied for this job")
+    }
+
+    await getOrCreateMonthlyUsage(userId)
+    const monthKey = getCurrentMonth()
+
+    let usageIncremented = false
+    let consumedPaymentId = null
+
+    try {
+        // Reserve one free application atomically if the seeker is below five.
+        const freeReservation = await applicationUsage.updateOne(
+            {
+                userId,
+                monthKey,
+                count: { $lt: FREE_APPLICATION_LIMIT },
+            },
+            { $inc: { count: 1 } }
+        )
+
+        let paymentMethod = "free"
+
+        if (freeReservation.modifiedCount === 1) {
+            usageIncremented = true
+
+            if (paymentId) {
+                throw new HttpError(400, "Payment is not required for this application")
+            }
+        } else {
+            // All five free applications have already been used.
+            if (!paymentId) {
+                throw new HttpError(
+                    402,
+                    "You have used all five free applications this month",
+                    {
+                        code: "PAYMENT_REQUIRED",
+                        limit: FREE_APPLICATION_LIMIT,
+                        month: monthKey,
+                        fee: APPLICATION_FEE_BDT,
+                        currency: "BDT",
+                    }
+                )
+            }
+
+            const paymentObjectId = new ObjectId(paymentId)
+
+            // A payment can be used once, for the same user, job and month only.
+            const paymentResult = await applicationPayments.updateOne(
+                {
+                    _id: paymentObjectId,
+                    userId,
+                    jobId,
+                    monthKey,
+                    status: "succeeded",
+                    usedAt: null,
+                },
+                { $set: { usedAt: new Date() } }
+            )
+
+            if (paymentResult.modifiedCount !== 1) {
+                throw new HttpError(
+                    400,
+                    "Payment is invalid, already used, or expired"
+                )
+            }
+
+            consumedPaymentId = paymentObjectId
+            paymentMethod = "demo"
+
+            await applicationUsage.updateOne(
+                { userId, monthKey },
+                { $inc: { count: 1 } }
+            )
+            usageIncremented = true
         }
 
         const newApplication = {
@@ -161,6 +612,8 @@ app.post("/applications", async (req, res) => {
             jobTitle: job.title,
             companyName: job.company,
             status: "pending",
+            paymentId: consumedPaymentId?.toString() || null,
+            paymentMethod,
             appliedAt: new Date(),
         }
 
@@ -170,103 +623,83 @@ app.post("/applications", async (req, res) => {
             success: true,
             message: "Application submitted successfully",
             insertedId: result.insertedId,
+            paymentMethod,
         })
-
     } catch (error) {
-        console.error("Create Application Error:", error)
+        // Undo the monthly counter/payment reservation if inserting fails.
+        if (usageIncremented) {
+            await applicationUsage.updateOne(
+                { userId, monthKey, count: { $gt: 0 } },
+                { $inc: { count: -1 } }
+            )
+        }
 
-        res.status(500).json({
-            success: false,
-            message: "Failed to submit application",
-        })
+        if (consumedPaymentId) {
+            await applicationPayments.updateOne(
+                { _id: consumedPaymentId },
+                { $unset: { usedAt: "" } }
+            )
+        }
+
+        throw error
     }
 })
 
+app.post("/applications", submitApplication)
+app.post("/applications/apply", submitApplication)
 
-// Check whether a seeker has applied for a job
-app.get("/applications/check", async (req, res) => {
-    try {
+// -----------------------------------------------------------------------------
+// APPLICATION CHECK / WITHDRAW / SEEKER / RECRUITER
+// -----------------------------------------------------------------------------
+
+app.get(
+    "/applications/check",
+    asyncHandler(async (req, res) => {
         const { jobId, userId } = req.query
 
         if (!jobId || !userId) {
-            return res.status(400).json({
-                success: false,
-                message: "Job ID and user ID are required",
-            })
+            throw new HttpError(400, "Job ID and user ID are required")
         }
 
-        const application = await applications.findOne({
-            jobId,
-            userId,
-        })
+        const application = await applications.findOne({ jobId, userId })
 
         res.status(200).json({
             success: true,
             hasApplied: Boolean(application),
         })
-    } catch (error) {
-        console.error("Check Application Error:", error)
+    })
+)
 
-        res.status(500).json({
-            success: false,
-            message: "Failed to check application",
-        })
-    }
-})
-
-
-// Withdraw an application
-app.delete("/applications", async (req, res) => {
-    try {
+app.delete(
+    "/applications",
+    asyncHandler(async (req, res) => {
         const { jobId, userId } = req.body
 
         if (!jobId || !userId) {
-            return res.status(400).json({
-                success: false,
-                message: "Job ID and user ID are required",
-            })
+            throw new HttpError(400, "Job ID and user ID are required")
         }
 
-        const result = await applications.deleteOne({
-            jobId,
-            userId,
-        })
+        const result = await applications.deleteOne({ jobId, userId })
 
-        if (result.deletedCount === 0) {
-            return res.status(404).json({
-                success: false,
-                message: "Application not found",
-            })
+        if (!result.deletedCount) {
+            throw new HttpError(404, "Application not found")
         }
+
+        // Deliberately do not decrement monthly usage when withdrawing.
+        // A submitted application still consumes that month's allowance.
 
         res.status(200).json({
             success: true,
             message: "Application withdrawn successfully",
         })
-    } catch (error) {
-        console.error("Withdraw Application Error:", error)
+    })
+)
 
-        res.status(500).json({
-            success: false,
-            message: "Failed to withdraw application",
-        })
-    }
-})
-
-
-
-
-// GET: Applications submitted by a seeker
-app.get("/applications/seeker/:userId", async (req, res) => {
-    try {
+app.get(
+    "/applications/seeker/:userId",
+    asyncHandler(async (req, res) => {
         const { userId } = req.params
-
-        if (!userId) {
-            return res.status(400).json({
-                success: false,
-                message: "User ID is required",
-            })
-        }
+        if (!userId) throw new HttpError(400, "User ID is required")
 
         const seekerApplications = await applications
             .find({ userId })
@@ -275,13 +708,9 @@ app.get("/applications/seeker/:userId", async (req, res) => {
 
         const enrichedApplications = await Promise.all(
             seekerApplications.map(async (application) => {
-                let job = null
-
-                if (ObjectId.isValid(application.jobId)) {
-                    job = await jobs.findOne({
-                        _id: new ObjectId(application.jobId),
-                    })
-                }
+                const job = isValidId(application.jobId)
+                    ? await jobs.findOne({ _id: new ObjectId(application.jobId) })
+                    : null
 
                 return {
                     ...application,
@@ -299,54 +728,25 @@ app.get("/applications/seeker/:userId", async (req, res) => {
             success: true,
             applications: enrichedApplications,
         })
-    } catch (error) {
-        console.error("Get Seeker Applications Error:", error)
+    })
+)
 
-        res.status(500).json({
-            success: false,
-            message: "Failed to retrieve applications",
-        })
-    }
-})
-
-// GET: Applicants for a specific job (recruiter view)
-app.get("/applications/job/:jobId", async (req, res) => {
-    try {
+app.get(
+    "/applications/job/:jobId",
+    asyncHandler(async (req, res) => {
         const { jobId } = req.params
         const { recruiterId } = req.query
 
-        if (!ObjectId.isValid(jobId)) {
-            return res.status(400).json({
-                success: false,
-                message: "Invalid job ID",
-            })
+        if (!isValidId(jobId)) throw new HttpError(400, "Invalid job ID")
+        if (typeof recruiterId !== "string" || !recruiterId) {
+            throw new HttpError(400, "Recruiter ID is required")
         }
 
-        if (!recruiterId || typeof recruiterId !== "string") {
-            return res.status(400).json({
-                success: false,
-                message: "Recruiter ID is required",
-            })
-        }
+        const job = await jobs.findOne({ _id: new ObjectId(jobId) })
+        if (!job) throw new HttpError(404, "Job not found")
 
-        const job = await jobs.findOne({
-            _id: new ObjectId(jobId),
-        })
-
-        if (!job) {
-            return res.status(404).json({
-                success: false,
-                message: "Job not found",
-            })
-        }
-
-        // This assumes each job document stores its recruiter's ID
-        // as recruiterId. Use the actual field from your job documents.
         if (job.recruiterId !== recruiterId) {
-            return res.status(403).json({
-                success: false,
-                message: "You are not authorized to view these applicants",
-            })
+            throw new HttpError(403, "You are not authorized to view these applicants")
         }
 
         const jobApplications = await applications
@@ -356,9 +756,7 @@ app.get("/applications/job/:jobId", async (req, res) => {
 
         const enrichedApplicants = await Promise.all(
             jobApplications.map(async (application) => {
-                const applicant = await users.findOne({
-                    email: application.email,
-                })
+                const applicant = await users.findOne({ email: application.email })
 
                 return {
                     ...application,
@@ -379,295 +777,53 @@ app.get("/applications/job/:jobId", async (req, res) => {
             },
             applicants: enrichedApplicants,
         })
-    } catch (error) {
-        console.error("Get Job Applicants Error:", error)
+    })
+)
 
-        res.status(500).json({
-            success: false,
-            message: "Failed to retrieve applicants",
-        })
-    }
-})
+// -----------------------------------------------------------------------------
+// ROOT + CENTRAL ERROR HANDLER
+// -----------------------------------------------------------------------------
 
-
-
-
-app.get("/jobs", async (req, res) => {
-    try {
-        const query = {}
-
-        // Get a query parameter as a string
-        const getString = (value) => {
-            if (typeof value === "string") {
-                return value.trim()
-            }
-            return ""
-        }
-
-        // Escape special regex characters
-        const escapeRegex = (value) => {
-            return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-        }
-
-        // Create case-insensitive regex
-        const makeRegex = (value) => {
-            return new RegExp(escapeRegex(value), "i")
-        }
-
-        // --------------------------------
-        // 1. General text search
-        // --------------------------------
-
-        const search = getString(req.query.search)
-
-        if (search) {
-            const searchRegex = makeRegex(search)
-
-            query.$or = [
-                { title: searchRegex },
-                { company: searchRegex },
-                { category: searchRegex },
-                { location: searchRegex },
-                { description: searchRegex },
-                { responsibilities: searchRegex },
-                { requirements: searchRegex },
-                { skills: searchRegex },
-            ]
-        }
-
-        // --------------------------------
-        // 2. Partial string filters
-        // --------------------------------
-
-        const stringFields = [
-            "title",
-            "company",
-            "category",
-            "location",
-            "description",
-            "responsibilities",
-            "requirements",
-        ]
-
-        stringFields.forEach((field) => {
-            const value = getString(req.query[field])
-
-            if (value) {
-                query[field] = makeRegex(value)
-            }
-        })
-
-        // --------------------------------
-        // 3. Exact enum filters
-        // --------------------------------
-
-        const enumFields = [
-            "employmentType",
-            "workplaceType",
-            "experience",
-            "currency",
-            "status",
-        ]
-
-        enumFields.forEach((field) => {
-            const value = getString(req.query[field])
-
-            if (value) {
-                query[field] = makeRegex(value)
-            }
-        })
-
-        // --------------------------------
-        // 4. Skills array filter
-        // --------------------------------
-
-        let skills = req.query.skills || []
-
-        if (!Array.isArray(skills)) {
-            skills = [skills]
-        }
-
-        skills = skills
-            .flatMap((skill) => String(skill).split(","))
-            .map((skill) => skill.trim())
-            .filter(Boolean)
-
-        if (skills.length > 0) {
-            query.skills = {
-                $in: skills.map((skill) => makeRegex(skill)),
-            }
-        }
-
-        // --------------------------------
-        // 5. Salary filters
-        // --------------------------------
-
-        const minSalaryValue = getString(req.query.salaryMin)
-        const maxSalaryValue = getString(req.query.salaryMax)
-
-        const minSalary = minSalaryValue
-            ? Number(minSalaryValue)
-            : null
-
-        const maxSalary = maxSalaryValue
-            ? Number(maxSalaryValue)
-            : null
-
-        if (
-            (minSalary !== null &&
-                (!Number.isFinite(minSalary) || minSalary < 0)) ||
-            (maxSalary !== null &&
-                (!Number.isFinite(maxSalary) || maxSalary < 0)) ||
-            (minSalary !== null &&
-                maxSalary !== null &&
-                minSalary > maxSalary)
-        ) {
-            return res.status(400).json({
-                success: false,
-                message: "Invalid salary range",
-            })
-        }
-
-        // Job's minimum salary must be >= requested minimum
-        if (minSalary !== null) {
-            query.salaryMin = { $gte: minSalary }
-        }
-
-        // Job's maximum salary must be <= requested maximum
-        if (maxSalary !== null) {
-            query.salaryMax = { $lte: maxSalary }
-        }
-
-        // --------------------------------
-        // 6. Application deadline filters
-        // --------------------------------
-
-        const deadlineBefore = getString(req.query.deadlineBefore)
-        const deadlineAfter = getString(req.query.deadlineAfter)
-
-        if (deadlineBefore || deadlineAfter) {
-            query.applicationDeadline = {}
-
-            if (deadlineBefore) {
-                query.applicationDeadline.$lte = deadlineBefore
-            }
-
-            if (deadlineAfter) {
-                query.applicationDeadline.$gte = deadlineAfter
-            }
-        }
-
-        // --------------------------------
-        // 7. Fetch filtered jobs
-        // --------------------------------
-
-        const result = await jobs.find(query).toArray()
-
-        // Convert MongoDB ObjectId to string
-        const formattedJobs = result.map((job) => ({
-            ...job,
-            _id: job._id.toString(),
-        }))
-
-        res.status(200).json(formattedJobs)
-
-    } catch (error) {
-        console.error("Error fetching jobs:", error)
-
-        res.status(500).json({
-            success: false,
-            message: "Failed to fetch jobs",
-            error: error.message,
-        })
-    }
-})
-
-
-
-app.delete("/jobs/:id", async (req, res) => {
-    try {
-        const { id } = req.params
-
-        if (!ObjectId.isValid(id)) {
-            return res.status(400).json({
-                success: false,
-                message: "Invalid job ID",
-            })
-        }
-
-        const result = await jobs.deleteOne({
-            _id: new ObjectId(id),
-        })
-
-        if (result.deletedCount === 0) {
-            return res.status(404).json({
-                success: false,
-                message: "Job not found",
-            })
-        }
-
-        res.status(200).json({
-            success: true,
-            message: "Job deleted successfully",
-        })
-    } catch (error) {
-        console.error("Delete Job Error:", error)
-
-        res.status(500).json({
-            success: false,
-            message: "Failed to delete job",
-        })
-    }
-})
-
-
-
-// get job details page 
-
-app.get("/jobs/:id", async (req, res) => {
-    try {
-        const { id } = req.params
-
-        // Validate MongoDB ObjectId
-        if (!ObjectId.isValid(id)) {
-            return res.status(400).send({
-                message: "Invalid job ID",
-            })
-        }
-
-        // Find the selected job
-        const job = await jobs.findOne({
-            _id: new ObjectId(id),
-        })
-
-        // Check whether the job exists
-        if (!job) {
-            return res.status(404).send({
-                message: "Job not found",
-            })
-        }
-
-        // Return the selected job
-        res.status(200).send({
-            ...job,
-            _id: job._id.toString(),
-        })
-    } catch (error) {
-        console.error("Failed to fetch job:", error)
-
-        res.status(500).send({
-            message: "Failed to fetch job details",
-        })
-    }
-})
-
-
-// Root route
 app.get("/", (req, res) => {
     res.send("Hire Loop is looping!")
 })
 
-// Start server
-app.listen(port, () => {
-    console.log(`Hireloop is listening on port ${port}`)
+// Express error middleware: one place handles errors from async routes.
+app.use((error, req, res, next) => {
+    console.error(`${req.method} ${req.originalUrl}:`, error)
+
+    if (res.headersSent) return next(error)
+
+    if (error.code === 11000) {
+        return res.status(409).json({
+            success: false,
+            message: "You have already applied for this job",
+        })
+    }
+
+    const status = error.status || 500
+
+    res.status(status).json({
+        success: false,
+        message: error.message || "Internal server error",
+        ...error.extra,
+    })
+})
+
+// Connect, create indexes, then start listening.
+const startServer = async () => {
+    await client.connect()
+    console.log("Successfully connected to MongoDB")
+
+    await createIndexes()
+    console.log("MongoDB indexes are ready")
+
+    app.listen(port, () => {
+        console.log(`HireLoop is listening on port ${port}`)
+    })
+}
+
+startServer().catch((error) => {
+    console.error("Failed to start HireLoop server:", error)
+    process.exit(1)
 })
